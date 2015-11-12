@@ -6,6 +6,7 @@
 #include <psl/net.h>
 #include <psl/log.h>
 #include <psl/terminal.h>
+#include <psl/type_traits.h>
 
 #include <boost/program_options.hpp>
 #include <boost/algorithm/string.hpp>
@@ -14,8 +15,17 @@ enum LockMode {
     X = 1,
     S = 1<<1,
     IX = 1<<2,
-    IS = 1<<3
+    IS = 1<<3,
+    SIZE
 };
+
+// inline LockMode operator|(const LockMode& a, const LockMode& b) {
+//     return static_cast<LockMode>(psl::to_underlying(a) | psl::to_underlying(b));
+// }
+//
+// inline LockMode operator&(const LockMode& a, const LockMode& b) {
+//     return static_cast<LockMode>(psl::to_underlying(a) & psl::to_underlying(b));
+// }
 
 inline std::istream& operator>>(std::istream& in, LockMode& mode) {
     std::string str;
@@ -52,7 +62,44 @@ struct Transaction {
     std::vector<decltype(lock)::iterator> unlock;
 };
 
-std::vector<Transaction> trxs;
+static std::vector<Transaction> trxs;
+
+
+/* upgrade[old][new] = upgraded mode */
+static LockMode upgrade[LockMode::SIZE][LockMode::SIZE] = {};
+
+static void init_upgrade() {
+    upgrade[LockMode::X][LockMode::X] = LockMode::X;
+    upgrade[LockMode::X][LockMode::S] = LockMode::X;
+    upgrade[LockMode::X][LockMode::IX] = LockMode::X;
+    upgrade[LockMode::X][LockMode::IS] = LockMode::X;
+
+    upgrade[LockMode::S][LockMode::X] = LockMode::X;
+    upgrade[LockMode::S][LockMode::S] = LockMode::S;
+    upgrade[LockMode::S][LockMode::IX] = LockMode::X;
+    upgrade[LockMode::S][LockMode::IS] = LockMode::S;
+
+    upgrade[LockMode::IX][LockMode::X] = LockMode::X;
+    upgrade[LockMode::IX][LockMode::S] = LockMode::X;
+    upgrade[LockMode::IX][LockMode::IX] = LockMode::IX;
+    upgrade[LockMode::IX][LockMode::IS] =
+        static_cast<LockMode>(LockMode::IS | LockMode::IX);
+
+    upgrade[LockMode::IS][LockMode::X] = LockMode::X;
+    upgrade[LockMode::IS][LockMode::S] = LockMode::S;
+    upgrade[LockMode::IS][LockMode::IX] =
+        static_cast<LockMode>(LockMode::IS | LockMode::IX);
+    upgrade[LockMode::IS][LockMode::IS] = LockMode::IS;
+
+    upgrade[static_cast<LockMode>(LockMode::IS | LockMode::IX)][LockMode::X] =
+        LockMode::X;
+    upgrade[static_cast<LockMode>(LockMode::IS | LockMode::IX)][LockMode::S] =
+        LockMode::X;
+    upgrade[static_cast<LockMode>(LockMode::IS | LockMode::IX)][LockMode::IX] =
+        static_cast<LockMode>(LockMode::IS | LockMode::IX);
+    upgrade[static_cast<LockMode>(LockMode::IS | LockMode::IX)][LockMode::IS] =
+        static_cast<LockMode>(LockMode::IS | LockMode::IX);
+}
 
 int parse_lock_log(std::istream& in, size_t record_lock_limit) {
     std::multimap<size_t, decltype(Transaction::lock)::iterator> table_map;
@@ -111,16 +158,16 @@ int parse_lock_log(std::istream& in, size_t record_lock_limit) {
         LOG_ERR_EXIT(ss.fail(), EINVAL, std::system_category());
 
         if (lock) {
-            if (std::find(trx->lock.crbegin(), trx->lock.crend(), key)
-                    == trx->lock.crend()) {
+            auto lockit = std::find(trx->lock.rbegin(), trx->lock.rend(), key);
+            if (lockit == trx->lock.rend()) {
                 if (record) {
                     size_t table_key = hashfn(strs[12]);
-                    auto it = std::find(trx->lock.begin(), trx->lock.end(), table_key);
-                    LOG_ERR_EXIT(it == trx->lock.end(), EINVAL, std::system_category());
+                    auto table_lock = std::find(trx->lock.begin(), trx->lock.end(), table_key);
+                    LOG_ERR_EXIT(table_lock == trx->lock.end(), EINVAL, std::system_category());
 
                     /* if we locked the table S or X we do not need to take the
                      * record lock anymore (record_limit optimization) */
-                    if (it->mode & (LockMode::IS | LockMode::IX)) {
+                    if (table_lock->mode & (LockMode::IS | LockMode::IX)) {
                         auto table_range = table_map.equal_range(table_key);
                         if (std::distance(table_range.first, table_range.second) > record_lock_limit) {
                             /* 1. remove all records locks of this table
@@ -130,7 +177,7 @@ int parse_lock_log(std::istream& in, size_t record_lock_limit) {
                                 trx->lock.erase(to_delete->second);
                                 to_delete = table_map.erase(to_delete);
                             }
-                            it->mode = it->mode & LockMode::IX ? LockMode::X : LockMode::S;
+                            table_lock->mode = table_lock->mode & LockMode::IX ? LockMode::X : LockMode::S;
                          } else {
                             auto new_lock = trx->lock.insert(trx->lock.end(), {key, dbg_str ,mode});
                             table_map.insert({table_key, new_lock});
@@ -140,11 +187,11 @@ int parse_lock_log(std::istream& in, size_t record_lock_limit) {
                     trx->lock.push_back({key, dbg_str, mode});
                 }
             } else {
-                // TODO: std::cout << "upgrade?\n";
+                lockit->mode = upgrade[lockit->mode][mode];
             }
         } else if (!record) { /* unlock table (unlocks also record locks) */
             /* ASSUMPTION: SS2PL, i.e. all locks are released after commit:
-             * 1) No unlock order
+             * 1) No unlock order (other than record before table)
              * 2) locks are not downgraded (X -> S) etc. always unlock in one go */
 
             auto it = std::find(trx->lock.begin(), trx->lock.end(), key);
@@ -199,6 +246,7 @@ int main(int argc, char* argv[]) {
 
     LOG_ERR_EXIT(!lock_log.good(), EINVAL, std::system_category());
 
+    init_upgrade();
     int ret;
     LOG_ERR_EXIT((ret = parse_lock_log(lock_log, vm["limit"].as<size_t>())), ret,
             std::system_category());
