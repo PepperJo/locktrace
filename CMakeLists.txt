@@ -3,7 +3,7 @@ set(CMAKE_EXPORT_COMPILE_COMMANDS ON)
 
 project(locktrace)
 
-set(PSL_DIR ${CMAKE_SOURCE_DIR}/../psl)
+set(PSL_DIR ${CMAKE_SOURCE_DIR}/../../IBM/psl)
 include_directories(${CMAKE_SOURCE_DIR} ${PSL_DIR}/include)
 link_directories(${PSL_DIR}/build/lib)
 
