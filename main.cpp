@@ -12,20 +12,92 @@
 #include <boost/algorithm/string.hpp>
 
 enum LockMode {
-    X = 1,
-    S = 1<<1,
-    IX = 1<<2,
-    IS = 1<<3,
+    NL,
+    X,
+    S,
+    IX,
+    IS,
+    SIX,
     SIZE
 };
 
-// inline LockMode operator|(const LockMode& a, const LockMode& b) {
-//     return static_cast<LockMode>(psl::to_underlying(a) | psl::to_underlying(b));
-// }
-//
-// inline LockMode operator&(const LockMode& a, const LockMode& b) {
-//     return static_cast<LockMode>(psl::to_underlying(a) & psl::to_underlying(b));
-// }
+/* upgrade[old][new] = upgraded mode */
+static LockMode upgrade[LockMode::SIZE][LockMode::SIZE] = {
+    [LockMode::NL] = {
+        [LockMode::NL] = LockMode::NL,
+        [LockMode::X] = LockMode::X,
+        [LockMode::S] = LockMode::S,
+        [LockMode::IX] = LockMode::IX,
+        [LockMode::IS] = LockMode::IS,
+        [LockMode::SIX] = LockMode::SIX
+    },
+    [LockMode::X] = {
+        [LockMode::NL] = LockMode::X,
+        [LockMode::X] = LockMode::X,
+        [LockMode::S] = LockMode::X,
+        [LockMode::IX] = LockMode::X,
+        [LockMode::IS] = LockMode::X,
+        [LockMode::SIX] = LockMode::X
+    },
+    [LockMode::S] = {
+        [LockMode::NL] = LockMode::S,
+        [LockMode::X] = LockMode::X,
+        [LockMode::S] = LockMode::S,
+        [LockMode::IX] = LockMode::SIX,
+        [LockMode::IS] = LockMode::S,
+        [LockMode::SIX] = LockMode::SIX
+    },
+    [LockMode::IX] = {
+        [LockMode::NL] = LockMode::IX,
+        [LockMode::X] = LockMode::X,
+        [LockMode::S] = LockMode::SIX,
+        [LockMode::IX] = LockMode::IX,
+        [LockMode::IS] = LockMode::IX,
+        [LockMode::SIX] = LockMode::SIX
+    },
+    [LockMode::IS] = {
+        [LockMode::NL] = LockMode::IS,
+        [LockMode::X] = LockMode::X,
+        [LockMode::S] = LockMode::S,
+        [LockMode::IX] = LockMode::IX,
+        [LockMode::IS] = LockMode::IS,
+        [LockMode::SIX] = LockMode::SIX
+    },
+    [LockMode::SIX] = {
+        [LockMode::NL] = LockMode::SIX,
+        [LockMode::X] = LockMode::X,
+        [LockMode::S] = LockMode::SIX,
+        [LockMode::IX] = LockMode::SIX,
+        [LockMode::IS] = LockMode::SIX,
+        [LockMode::SIX] = LockMode::SIX
+    }
+};
+
+inline std::ostream& operator<<(std::ostream& out, LockMode mode) {
+    static const char* lockmode_to_str[] = {
+        [LockMode::NL] = "NL",
+        [LockMode::X] = "X",
+        [LockMode::S] = "S",
+        [LockMode::IX] = "IX",
+        [LockMode::IS] = "IS",
+        [LockMode::SIX] = "SIX"
+    };
+    if (mode < 0 || mode >= LockMode::SIZE) {
+        out.setstate(std::ios_base::failbit);
+    } else {
+        out << lockmode_to_str[mode];
+    }
+    return out;
+}
+
+inline LockMode operator+(const LockMode a, const LockMode b) {
+    return upgrade[a][b];
+}
+
+inline LockMode operator+=(LockMode& a, const LockMode b) {
+    a = a + b;
+    return a;
+}
 
 inline std::istream& operator>>(std::istream& in, LockMode& mode) {
     std::string str;
@@ -50,6 +122,7 @@ struct Lock {
     LockKey key;
     std::string dbg_str;
     LockMode mode;
+    std::list<Lock>::iterator prev;
 };
 
 inline bool operator==(const Lock& a, const LockKey& key) {
@@ -63,43 +136,6 @@ struct Transaction {
 };
 
 static std::vector<Transaction> trxs;
-
-
-/* upgrade[old][new] = upgraded mode */
-static LockMode upgrade[LockMode::SIZE][LockMode::SIZE] = {};
-
-static void init_upgrade() {
-    upgrade[LockMode::X][LockMode::X] = LockMode::X;
-    upgrade[LockMode::X][LockMode::S] = LockMode::X;
-    upgrade[LockMode::X][LockMode::IX] = LockMode::X;
-    upgrade[LockMode::X][LockMode::IS] = LockMode::X;
-
-    upgrade[LockMode::S][LockMode::X] = LockMode::X;
-    upgrade[LockMode::S][LockMode::S] = LockMode::S;
-    upgrade[LockMode::S][LockMode::IX] = LockMode::X;
-    upgrade[LockMode::S][LockMode::IS] = LockMode::S;
-
-    upgrade[LockMode::IX][LockMode::X] = LockMode::X;
-    upgrade[LockMode::IX][LockMode::S] = LockMode::X;
-    upgrade[LockMode::IX][LockMode::IX] = LockMode::IX;
-    upgrade[LockMode::IX][LockMode::IS] =
-        static_cast<LockMode>(LockMode::IS | LockMode::IX);
-
-    upgrade[LockMode::IS][LockMode::X] = LockMode::X;
-    upgrade[LockMode::IS][LockMode::S] = LockMode::S;
-    upgrade[LockMode::IS][LockMode::IX] =
-        static_cast<LockMode>(LockMode::IS | LockMode::IX);
-    upgrade[LockMode::IS][LockMode::IS] = LockMode::IS;
-
-    upgrade[static_cast<LockMode>(LockMode::IS | LockMode::IX)][LockMode::X] =
-        LockMode::X;
-    upgrade[static_cast<LockMode>(LockMode::IS | LockMode::IX)][LockMode::S] =
-        LockMode::X;
-    upgrade[static_cast<LockMode>(LockMode::IS | LockMode::IX)][LockMode::IX] =
-        static_cast<LockMode>(LockMode::IS | LockMode::IX);
-    upgrade[static_cast<LockMode>(LockMode::IS | LockMode::IX)][LockMode::IS] =
-        static_cast<LockMode>(LockMode::IS | LockMode::IX);
-}
 
 int parse_lock_log(std::istream& in, size_t record_lock_limit) {
     std::multimap<size_t, decltype(Transaction::lock)::iterator> table_map;
@@ -149,7 +185,6 @@ int parse_lock_log(std::istream& in, size_t record_lock_limit) {
         LockKey key;
         std::string dbg_str = record ? strs[3] + ' ' + strs[5] + ' ' + strs[7] : strs[3];
         key = hashfn(dbg_str);
-        // std::cout << (record ? "record: " : "table: ") << key << '\n';
 
         LockMode mode;
         ss.clear();
@@ -159,35 +194,60 @@ int parse_lock_log(std::istream& in, size_t record_lock_limit) {
 
         if (lock) {
             auto lockit = std::find(trx->lock.rbegin(), trx->lock.rend(), key);
-            if (lockit == trx->lock.rend()) {
+            bool insert = true;
+            if(lockit != trx->lock.rend()) {
+                auto new_mode = lockit->mode + mode;
+                if (new_mode != lockit->mode) {
+                    /* need new lock */
+                    // std::cout << "(" << lockit->mode << "+" << mode
+                    //     << ") -> " << new_mode << '\n';
+                    mode = new_mode;
+                } else {
+                    insert = false;
+                }
+            }
+            if (insert) {
                 if (record) {
                     size_t table_key = hashfn(strs[12]);
                     auto table_lock = std::find(trx->lock.begin(), trx->lock.end(), table_key);
                     LOG_ERR_EXIT(table_lock == trx->lock.end(), EINVAL, std::system_category());
 
                     /* if we locked the table S or X we do not need to take the
-                     * record lock anymore (record_limit optimization) */
-                    if (table_lock->mode & (LockMode::IS | LockMode::IX)) {
+                     * record lock anymore (record_limit optimization)
+                     * checking if things are compatible is not our job! */
+                    if (    table_lock->mode == LockMode::IS ||
+                            table_lock->mode == LockMode::IX ||
+                            (table_lock->mode == LockMode::SIX && mode == LockMode::X)) {
                         auto table_range = table_map.equal_range(table_key);
                         if (std::distance(table_range.first, table_range.second) > record_lock_limit) {
                             /* 1. remove all records locks of this table
                              * (including the on we just inserted)
-                             * 2. take table lock (S|X)! */
+                             * 2. remove all table locks expect first
+                             * 2. upgrade first table lock (S|X)! */
                             for (auto to_delete = table_range.first; to_delete != table_range.second;) {
                                 trx->lock.erase(to_delete->second);
                                 to_delete = table_map.erase(to_delete);
                             }
-                            table_lock->mode = table_lock->mode & LockMode::IX ? LockMode::X : LockMode::S;
+
+                            LockMode new_mode = LockMode::NL;
+                            for (auto prev = table_lock->prev;
+                                    prev != trx->lock.end(); prev = table_lock->prev) {
+                                new_mode += table_lock->mode;
+                                trx->lock.erase(table_lock);
+                                table_lock = prev;
+                            }
+                            table_lock->mode += new_mode;
+                            /* we need at least S */
+                            table_lock->mode += LockMode::S;
                          } else {
-                            auto new_lock = trx->lock.insert(trx->lock.end(), {key, dbg_str ,mode});
+                            auto new_lock = trx->lock.insert(trx->lock.end(),
+                                    {key, dbg_str + " " + strs[12] ,mode});
                             table_map.insert({table_key, new_lock});
                          }
                     }
                 } else {
-                    trx->lock.push_back({key, dbg_str, mode});
+                    trx->lock.push_back({key, dbg_str, mode, trx->lock.end()});
                 }
-            } else {
-                lockit->mode = upgrade[lockit->mode][mode];
             }
         } else if (!record) { /* unlock table (unlocks also record locks) */
             /* ASSUMPTION: SS2PL, i.e. all locks are released after commit:
@@ -246,7 +306,6 @@ int main(int argc, char* argv[]) {
 
     LOG_ERR_EXIT(!lock_log.good(), EINVAL, std::system_category());
 
-    init_upgrade();
     int ret;
     LOG_ERR_EXIT((ret = parse_lock_log(lock_log, vm["limit"].as<size_t>())), ret,
             std::system_category());
@@ -262,7 +321,7 @@ int main(int argc, char* argv[]) {
         std::cout << "n_unlocks: " << trx.unlock.size() << '\n';
         for (auto& l : trx.lock) {
             std::cout << "LOCK " << l.dbg_str << " ["
-                << static_cast<uint32_t>(l.mode) << "]\n";
+                << l.mode << "]\n";
         }
         for (auto ul : trx.unlock) {
             std::cout << "UNLOCK " << ul->dbg_str << '\n';
