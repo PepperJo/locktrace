@@ -122,7 +122,7 @@ struct Lock {
     LockKey key;
     std::string dbg_str;
     LockMode mode;
-    std::list<Lock>::iterator prev;
+    const std::list<Lock>::iterator prev;
 };
 
 inline bool operator==(const Lock& a, const LockKey& key) {
@@ -158,7 +158,7 @@ int parse_lock_log(std::istream& in, size_t record_lock_limit) {
             if (!lock) {
                 /* 2PL -> started a new transaction! */
                 table_map.clear();
-                trx = trxs.insert(trxs.end(), Transaction{0});
+                trx = trxs.insert(trxs.end(), Transaction{0, {}, {}});
             }
             lock = true;
         }
@@ -198,9 +198,6 @@ int parse_lock_log(std::istream& in, size_t record_lock_limit) {
             if(lockit != trx->lock.rend()) {
                 auto new_mode = lockit->mode + mode;
                 if (new_mode != lockit->mode) {
-                    /* need new lock */
-                    // std::cout << "(" << lockit->mode << "+" << mode
-                    //     << ") -> " << new_mode << '\n';
                     mode = new_mode;
                 } else {
                     insert = false;
@@ -208,9 +205,9 @@ int parse_lock_log(std::istream& in, size_t record_lock_limit) {
             }
             if (insert) {
                 if (record) {
-                    size_t table_key = hashfn(strs[12]);
-                    auto table_lock = std::find(trx->lock.begin(), trx->lock.end(), table_key);
-                    LOG_ERR_EXIT(table_lock == trx->lock.end(), EINVAL, std::system_category());
+                    auto table_lock = std::find(trx->lock.rbegin(),
+                            trx->lock.rend(), hashfn(strs[12]));
+                    LOG_ERR_EXIT(table_lock == trx->lock.rend(), EINVAL, std::system_category());
 
                     /* if we locked the table S or X we do not need to take the
                      * record lock anymore (record_limit optimization)
@@ -218,35 +215,41 @@ int parse_lock_log(std::istream& in, size_t record_lock_limit) {
                     if (    table_lock->mode == LockMode::IS ||
                             table_lock->mode == LockMode::IX ||
                             (table_lock->mode == LockMode::SIX && mode == LockMode::X)) {
-                        auto table_range = table_map.equal_range(table_key);
-                        if (std::distance(table_range.first, table_range.second) > record_lock_limit) {
+                        auto table_range = table_map.equal_range(table_lock->key);
+                        if (std::distance(table_range.first, table_range.second)
+                                > record_lock_limit) {
                             /* 1. remove all records locks of this table
                              * (including the on we just inserted)
                              * 2. remove all table locks expect first
                              * 2. upgrade first table lock (S|X)! */
-                            for (auto to_delete = table_range.first; to_delete != table_range.second;) {
+                            for (auto to_delete = table_range.first;
+                                    to_delete != table_range.second;) {
                                 trx->lock.erase(to_delete->second);
                                 to_delete = table_map.erase(to_delete);
                             }
 
                             LockMode new_mode = LockMode::NL;
-                            for (auto prev = table_lock->prev;
-                                    prev != trx->lock.end(); prev = table_lock->prev) {
-                                new_mode += table_lock->mode;
-                                trx->lock.erase(table_lock);
-                                table_lock = prev;
+                            auto ftable_lock = std::next(table_lock).base();
+                            for (auto prev = ftable_lock->prev;
+                                    prev != trx->lock.end();
+                                    prev = ftable_lock->prev) {
+                                new_mode += ftable_lock->mode;
+                                trx->lock.erase(ftable_lock);
+                                ftable_lock = prev;
                             }
-                            table_lock->mode += new_mode;
+                            ftable_lock->mode += new_mode;
                             /* we need at least S */
-                            table_lock->mode += LockMode::S;
+                            ftable_lock->mode += LockMode::S;
                          } else {
                             auto new_lock = trx->lock.insert(trx->lock.end(),
-                                    {key, dbg_str + " " + strs[12] ,mode});
-                            table_map.insert({table_key, new_lock});
+                                    {key, dbg_str + " " + strs[12], mode,
+                                    std::next(lockit).base()});
+                            table_map.insert({table_lock->key, new_lock});
                          }
                     }
                 } else {
-                    trx->lock.push_back({key, dbg_str, mode, trx->lock.end()});
+                    trx->lock.push_back({key, dbg_str, mode,
+                            std::next(lockit).base()});
                 }
             }
         } else if (!record) { /* unlock table (unlocks also record locks) */
@@ -269,6 +272,7 @@ int parse_lock_log(std::istream& in, size_t record_lock_limit) {
                 }
                 trx->unlock.emplace_back(it);
             }
+            /* TODO: handle unlock different kind! */
         }
     }
     return 0;
