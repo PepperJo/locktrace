@@ -9,6 +9,7 @@ link_directories(${PSL_DIR}/build/lib)
 
 add_compile_options(-std=c++14)
 add_compile_options(-Wall -Werror)
+add_compile_options(-march=native)
 
 find_package(Boost COMPONENTS program_options system chrono REQUIRED)
 include_directories(${Boost_INCLUDE_DIR})
