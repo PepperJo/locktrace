@@ -2,6 +2,9 @@
 #include <fstream>
 #include <sstream>
 #include <functional>
+#include <iterator>
+#include <regex>
+#include <string>
 
 #include <psl/net.h>
 #include <psl/log.h>
@@ -14,17 +17,21 @@
 enum LockMode { NL, X, S, IX, IS, SIX, SIZE };
 
 /* upgrade[old][new] = upgraded mode */
-static LockMode upgrade[LockMode::SIZE][LockMode::SIZE] =
+static const LockMode upgrade[LockMode::SIZE][LockMode::SIZE] =
     {[LockMode::NL] = {[LockMode::NL] = LockMode::NL,
-                       [LockMode::X] = LockMode::X, [LockMode::S] = LockMode::S,
+                       [LockMode::X] = LockMode::X,
+                       [LockMode::S] = LockMode::S,
                        [LockMode::IX] = LockMode::IX,
                        [LockMode::IS] = LockMode::IS,
                        [LockMode::SIX] = LockMode::SIX},
-     [LockMode::X] = {[LockMode::NL] = LockMode::X, [LockMode::X] = LockMode::X,
-                      [LockMode::S] = LockMode::X, [LockMode::IX] = LockMode::X,
+     [LockMode::X] = {[LockMode::NL] = LockMode::X,
+                      [LockMode::X] = LockMode::X,
+                      [LockMode::S] = LockMode::X,
+                      [LockMode::IX] = LockMode::X,
                       [LockMode::IS] = LockMode::X,
                       [LockMode::SIX] = LockMode::X},
-     [LockMode::S] = {[LockMode::NL] = LockMode::S, [LockMode::X] = LockMode::X,
+     [LockMode::S] = {[LockMode::NL] = LockMode::S,
+                      [LockMode::X] = LockMode::X,
                       [LockMode::S] = LockMode::S,
                       [LockMode::IX] = LockMode::SIX,
                       [LockMode::IS] = LockMode::S,
@@ -36,7 +43,8 @@ static LockMode upgrade[LockMode::SIZE][LockMode::SIZE] =
                        [LockMode::IS] = LockMode::IX,
                        [LockMode::SIX] = LockMode::SIX},
      [LockMode::IS] = {[LockMode::NL] = LockMode::IS,
-                       [LockMode::X] = LockMode::X, [LockMode::S] = LockMode::S,
+                       [LockMode::X] = LockMode::X,
+                       [LockMode::S] = LockMode::S,
                        [LockMode::IX] = LockMode::IX,
                        [LockMode::IS] = LockMode::IS,
                        [LockMode::SIX] = LockMode::SIX},
@@ -104,141 +112,167 @@ inline bool operator==(const Lock& a, const LockKey& key) {
 struct Transaction {
     uint64_t id;
     std::list<Lock> lock;
-    // std::vector<decltype(lock)::iterator> unlock;
+    std::multimap<size_t, decltype(Transaction::lock)::iterator> table_map;
 };
 
-static std::vector<Transaction> trxs;
+static std::string parse_query_and_match(const std::string& line,
+        std::string regex_str) {
+    std::regex r(regex_str);
+    std::smatch results;
+    std::regex_search(line, results, r);
+    std::cerr << regex_str << '\n';
+    for (auto& x : results) {
+        std::cerr << x << '\n';
+    }
+    return "";
+}
 
-static int parse_lock_log(std::istream& in, size_t record_lock_limit) {
-    std::multimap<size_t, decltype(Transaction::lock)::iterator> table_map;
+template<class Iter>
+static bool record_to_table_lock(Transaction& trx, Iter table_lock,
+        size_t record_lock_limit) {
+    auto table_range =
+        trx.table_map.equal_range(table_lock->key);
+    if (std::distance(table_range.first,
+                      table_range.second) >
+        record_lock_limit) {
+        /* 1. remove all records locks of this table
+         * (including the on we just inserted)
+         * 2. remove all table locks expect first
+         * 2. upgrade first table lock (S|X)! */
+        for (auto to_delete = table_range.first;
+             to_delete != table_range.second;) {
+            trx.lock.erase(to_delete->second);
+            to_delete = trx.table_map.erase(to_delete);
+        }
+
+        LockMode new_mode = LockMode::NL;
+        auto ftable_lock = std::next(table_lock).base();
+        for (auto prev = ftable_lock->prev;
+             prev != trx.lock.end();
+             prev = ftable_lock->prev) {
+            new_mode += ftable_lock->mode;
+            trx.lock.erase(ftable_lock);
+            ftable_lock = prev;
+        }
+        ftable_lock->mode += new_mode;
+        /* we need at least S */
+        ftable_lock->mode += LockMode::S;
+        return true;
+    }
+
+    return false;
+}
+
+template<class T>
+static int parse_lock(const T& strs, Transaction& trx,
+        size_t record_lock_limit, std::string extra) {
+    bool record;
+    if (strs[0] == "TABLE") {
+        LOG_ERR_EXIT(strs.size() < 9, EINVAL, std::system_category());
+        record = false;
+    } else if (strs[0] == "RECORD") {
+        LOG_ERR_EXIT(strs.size() < 18, EINVAL, std::system_category());
+        record = true;
+    } else {
+        LOG_ERR_EXIT(true, EINVAL, std::system_category());
+    }
+
+    std::stringstream ss(strs[record ? 15 : 6]);
+    uint64_t trx_id;
+    ss >> trx_id;
+    LOG_ERR_EXIT(ss.fail(), EINVAL, std::system_category());
+    LOG_ERR_EXIT(trx.id != 0 && trx_id != trx.id, EINVAL,
+                 std::system_category());
+    trx.id = trx_id;
+
+    std::hash<std::string> hashfn;
+    LockKey key;
+    std::string dbg_str =
+        (record ? strs[3] + ' ' + strs[5] + ' ' + strs[7] : strs[3]);
+    dbg_str += ' ' + extra;
+    key = hashfn(dbg_str);
+
+    LockMode mode;
+    ss.clear();
+    ss.str(strs[record ? 17 : 8]);
+    ss >> mode;
+    LOG_ERR_EXIT(ss.fail(), EINVAL, std::system_category());
+
+    auto lockit = std::find(trx.lock.rbegin(), trx.lock.rend(), key);
+    bool insert = true;
+    if (lockit != trx.lock.rend()) {
+        /* only take new lock if we have a stricter mode */
+        auto new_mode = lockit->mode + mode;
+        if (new_mode != lockit->mode) {
+            mode = new_mode;
+        } else {
+            insert = false;
+        }
+    }
+    if (insert) {
+        if (record) {
+            std::string table_id = strs[12] + ' ' + extra;
+            auto table_lock = std::find(
+                trx.lock.rbegin(), trx.lock.rend(), hashfn(table_id));
+            LOG_ERR_EXIT(table_lock == trx.lock.rend(), EINVAL,
+                         std::system_category());
+
+            /* if we locked the table S or X we do not need to take the
+             * record lock anymore (record_limit optimization)
+             * checking if things are compatible is not our job! */
+            if (table_lock->mode == LockMode::IS ||
+                table_lock->mode == LockMode::IX ||
+                (table_lock->mode == LockMode::SIX &&
+                 mode == LockMode::X)) {
+                if (!record_to_table_lock(trx, table_lock, record_lock_limit)) {
+                    auto table_key = table_lock->key;
+                    auto new_lock = trx.lock.insert(
+                        trx.lock.end(),
+                        {key, dbg_str + " " + strs[12], mode,
+                         std::next(lockit).base()});
+                    trx.table_map.insert({table_key, new_lock});
+                }
+            }
+        } else {
+            trx.lock.push_back(
+                {key, dbg_str, mode, std::next(lockit).base()});
+        }
+    }
+    return 0;
+}
+
+template<class T>
+static int parse_lock_log(std::istream& in, T& trxs, size_t record_lock_limit,
+        std::string regex_str) {
     bool lock = false;
-    decltype(trxs)::iterator trx;
+    typename T::iterator trx;
+    std::string extra;
     while (in.good()) {
         std::string line;
         std::getline(in, line);
         if (!line.size()) {
             continue;
         }
-        std::deque<std::string> strs;
+        std::vector<std::string> strs;
         boost::split(strs, line, boost::is_any_of(" "));
-        if (strs.size() < 9)
-            std::cerr << line << '\n';
-        LOG_ERR_EXIT(strs.size() < 9, EINVAL, std::system_category());
+        LOG_ERR_EXIT(strs.size() < 2, EINVAL, std::system_category());
 
         if (strs[0] == "UNLOCK") {
             lock = false;
-            strs.pop_front();
-        } else if (strs[0] == "LOCK") {
+        } else if (strs[1] == "LOCK") {
             if (!lock) {
                 /* 2PL -> started a new transaction! */
-                table_map.clear();
-                trx = trxs.insert(trxs.end(), Transaction{0, {}});
+                trx = trxs.insert(trxs.end(), Transaction{0, {}, {}});
             }
             lock = true;
-        } else if (strs[0] == "PHYSICAL") {
-            
-        }
-
-        bool record;
-        if (strs[0] == "TABLE") {
-            LOG_ERR_EXIT(strs.size() < 9, EINVAL, std::system_category());
-            record = false;
-        } else if (strs[0] == "RECORD") {
-            LOG_ERR_EXIT(strs.size() < 18, EINVAL, std::system_category());
-            record = true;
+            parse_lock(strs, *trx, record_lock_limit, extra);
+        } else if (strs[0] == "QUERY") {
+             extra = parse_query_and_match(line, regex_str);
         } else {
+            std::cout << line << '\n';
             LOG_ERR_EXIT(true, EINVAL, std::system_category());
         }
 
-        std::stringstream ss(strs[record ? 15 : 6]);
-        uint64_t trx_id;
-        ss >> trx_id;
-        LOG_ERR_EXIT(ss.fail(), EINVAL, std::system_category());
-        LOG_ERR_EXIT(trx->id != 0 && trx_id != trx->id, EINVAL,
-                     std::system_category());
-        trx->id = trx_id;
-
-        std::hash<std::string> hashfn;
-        LockKey key;
-        std::string dbg_str =
-            record ? strs[3] + ' ' + strs[5] + ' ' + strs[7] : strs[3];
-        key = hashfn(dbg_str);
-
-        LockMode mode;
-        ss.clear();
-        ss.str(strs[record ? 17 : 8]);
-        ss >> mode;
-        if (ss.fail())
-            std::cerr << line << '\n';
-        LOG_ERR_EXIT(ss.fail(), EINVAL, std::system_category());
-
-        if (lock) {
-            auto lockit = std::find(trx->lock.rbegin(), trx->lock.rend(), key);
-            bool insert = true;
-            if (lockit != trx->lock.rend()) {
-                auto new_mode = lockit->mode + mode;
-                if (new_mode != lockit->mode) {
-                    mode = new_mode;
-                } else {
-                    insert = false;
-                }
-            }
-            if (insert) {
-                if (record) {
-                    auto table_lock = std::find(
-                        trx->lock.rbegin(), trx->lock.rend(), hashfn(strs[12]));
-                    LOG_ERR_EXIT(table_lock == trx->lock.rend(), EINVAL,
-                                 std::system_category());
-
-                    /* if we locked the table S or X we do not need to take the
-                     * record lock anymore (record_limit optimization)
-                     * checking if things are compatible is not our job! */
-                    if (table_lock->mode == LockMode::IS ||
-                        table_lock->mode == LockMode::IX ||
-                        (table_lock->mode == LockMode::SIX &&
-                         mode == LockMode::X)) {
-                        auto table_range =
-                            table_map.equal_range(table_lock->key);
-                        if (std::distance(table_range.first,
-                                          table_range.second) >
-                            record_lock_limit) {
-                            /* 1. remove all records locks of this table
-                             * (including the on we just inserted)
-                             * 2. remove all table locks expect first
-                             * 2. upgrade first table lock (S|X)! */
-                            for (auto to_delete = table_range.first;
-                                 to_delete != table_range.second;) {
-                                trx->lock.erase(to_delete->second);
-                                to_delete = table_map.erase(to_delete);
-                            }
-
-                            LockMode new_mode = LockMode::NL;
-                            auto ftable_lock = std::next(table_lock).base();
-                            for (auto prev = ftable_lock->prev;
-                                 prev != trx->lock.end();
-                                 prev = ftable_lock->prev) {
-                                new_mode += ftable_lock->mode;
-                                trx->lock.erase(ftable_lock);
-                                ftable_lock = prev;
-                            }
-                            ftable_lock->mode += new_mode;
-                            /* we need at least S */
-                            ftable_lock->mode += LockMode::S;
-                        } else {
-                            auto table_key = table_lock->key;
-                            auto new_lock = trx->lock.insert(
-                                trx->lock.end(),
-                                {key, dbg_str + " " + strs[12], mode,
-                                 std::next(lockit).base()});
-                            table_map.insert({table_key, new_lock});
-                        }
-                    }
-                } else {
-                    trx->lock.push_back(
-                        {key, dbg_str, mode, std::next(lockit).base()});
-                }
-            }
-        }
     }
     return 0;
 }
@@ -253,8 +287,10 @@ int main(int argc, char* argv[]) {
         "server port")("l", bop::value<std::string>()->required(),
                        "lock log-file")
         ("limit",
-        bop::value<size_t>()->default_value(std::numeric_limits<size_t>::max()),
-        "transaction record lock limit -> upgrade to table lock if reached");
+         bop::value<size_t>()->default_value(std::numeric_limits<size_t>::max()),
+        "transaction record lock limit -> upgrade to table lock if reached")
+        ("match", bop::value<std::string>()->default_value(""),
+         "regex to match for extra");
 
     bop::variables_map vm;
     bop::store(bop::command_line_parser(argc, argv).options(desc).run(), vm);
@@ -272,9 +308,11 @@ int main(int argc, char* argv[]) {
     std::fstream lock_log(lock_log_path);
     LOG_ERR_EXIT(!lock_log.good(), EINVAL, std::system_category());
 
+    std::vector<Transaction> trxs;
     int ret;
-    LOG_ERR_EXIT((ret = parse_lock_log(lock_log, vm["limit"].as<size_t>())),
-                 ret, std::system_category());
+    LOG_ERR_EXIT((ret = parse_lock_log(lock_log, trxs,
+                    vm["limit"].as<size_t>(), vm["match"].as<std::string>())),
+            ret, std::system_category());
 
     uint64_t n_locks_avg = 0;
     uint32_t nn = 0;
@@ -287,9 +325,9 @@ int main(int argc, char* argv[]) {
         for (auto& l : trx.lock) {
             std::cout << "LOCK " << l.dbg_str << " [" << l.mode << "]\n";
         }
-        for (auto ul = trx.lock.rbegin(); ul != trx.lock.rend(); ul++) {
-            std::cout << "UNLOCK " << ul->dbg_str << " [" << ul->mode << "]\n";
-        }
+        // for (auto ul = trx.lock.rbegin(); ul != trx.lock.rend(); ul++) {
+        //     std::cout << "UNLOCK " << ul->dbg_str << " [" << ul->mode << "]\n";
+        // }
         nn++;
     }
 
