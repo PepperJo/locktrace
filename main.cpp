@@ -13,6 +13,7 @@
 
 #include <boost/program_options.hpp>
 #include <boost/algorithm/string.hpp>
+#include <boost/regex.hpp>
 
 enum LockMode { NL, X, S, IX, IS, SIX, SIZE };
 
@@ -115,14 +116,37 @@ struct Transaction {
     std::multimap<size_t, decltype(Transaction::lock)::iterator> table_map;
 };
 
-static std::string parse_query_and_match(const std::string& line,
+template<class T>
+static std::string parse_query_and_match(const T& strs,
         std::string regex_str) {
-    std::regex r(regex_str);
-    std::smatch results;
-    std::regex_search(line, results, r);
-    std::cerr << regex_str << '\n';
-    for (auto& x : results) {
-        std::cerr << x << '\n';
+    bool insert = false;
+    typename T::const_iterator iter = strs.end();
+    if (strs[1] == "SELECT" || strs[1] == "UPDATE" || strs[1] == "DELETE") {
+        iter = std::find(strs.begin(), strs.end(), "WHERE");
+    } else if (strs[1] == "INSERT") {
+        iter = strs.begin() + 2;
+        insert = true;
+    }
+
+    boost::regex r(regex_str);
+    for (; iter != strs.end(); iter++)  {
+        if (boost::regex_search(*iter, r)) {
+            break;
+        }
+    }
+    if (iter != strs.end()) {
+        if (insert) {
+            size_t i = std::distance(strs.begin(), iter);
+            i -= 3;
+            iter = std::find(iter, strs.end(), "VALUES");
+            if (std::distance(iter, strs.end()) > i) {
+                std::string value = *(iter + i);
+                value.pop_back();
+                return value;
+            }
+        } else {
+            return *(iter + 2);
+        }
     }
     return "";
 }
@@ -243,7 +267,7 @@ static int parse_lock(const T& strs, Transaction& trx,
 
 template<class T>
 static int parse_lock_log(std::istream& in, T& trxs, size_t record_lock_limit,
-        std::string regex_str) {
+        const std::string regex_str) {
     bool lock = false;
     typename T::iterator trx;
     std::string extra;
@@ -267,7 +291,9 @@ static int parse_lock_log(std::istream& in, T& trxs, size_t record_lock_limit,
             lock = true;
             parse_lock(strs, *trx, record_lock_limit, extra);
         } else if (strs[0] == "QUERY") {
-             extra = parse_query_and_match(line, regex_str);
+            if (regex_str != "") {
+                extra = parse_query_and_match(strs, regex_str);
+            }
         } else {
             std::cout << line << '\n';
             LOG_ERR_EXIT(true, EINVAL, std::system_category());
