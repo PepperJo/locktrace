@@ -17,6 +17,7 @@
 
 enum LockMode { NL, X, S, IX, IS, SIX, SIZE };
 
+// clang-format off
 /* upgrade[old][new] = upgraded mode */
 static const LockMode upgrade[LockMode::SIZE][LockMode::SIZE] =
     {[LockMode::NL] = {[LockMode::NL] = LockMode::NL,
@@ -56,6 +57,45 @@ static const LockMode upgrade[LockMode::SIZE][LockMode::SIZE] =
                         [LockMode::IS] = LockMode::SIX,
                         [LockMode::SIX] = LockMode::SIX}};
 
+static const bool compatible[LockMode::SIZE][LockMode::SIZE] =
+    {[LockMode::NL] = {[LockMode::NL] = true,
+                       [LockMode::X] = true,
+                       [LockMode::S] = true,
+                       [LockMode::IX] = true,
+                       [LockMode::IS] = true,
+                       [LockMode::SIX] = true},
+     [LockMode::X] = {[LockMode::NL] = true,
+                      [LockMode::X] = false,
+                      [LockMode::S] = false,
+                      [LockMode::IX] = false,
+                      [LockMode::IS] = false,
+                      [LockMode::SIX] = false},
+     [LockMode::S] = {[LockMode::NL] = true,
+                      [LockMode::X] = false,
+                      [LockMode::S] = true,
+                      [LockMode::IX] = false,
+                      [LockMode::IS] = true,
+                      [LockMode::SIX] = false},
+     [LockMode::IX] = {[LockMode::NL] = true,
+                       [LockMode::X] = false,
+                       [LockMode::S] = false,
+                       [LockMode::IX] = true,
+                       [LockMode::IS] = true,
+                       [LockMode::SIX] = false},
+     [LockMode::IS] = {[LockMode::NL] = true,
+                       [LockMode::X] = false,
+                       [LockMode::S] = true,
+                       [LockMode::IX] = true,
+                       [LockMode::IS] = true,
+                       [LockMode::SIX] = true},
+     [LockMode::SIX] = {[LockMode::NL] = true,
+                        [LockMode::X] = false,
+                        [LockMode::S] = false,
+                        [LockMode::IX] = false,
+                        [LockMode::IS] = true,
+                        [LockMode::SIX] = false}};
+// clang-format off
+
 inline std::ostream& operator<<(std::ostream& out, LockMode mode) {
     static const char* lockmode_to_str[] = {[LockMode::NL] = "NL",
                                             [LockMode::X] = "X",
@@ -80,6 +120,10 @@ inline LockMode operator+=(LockMode& a, const LockMode b) {
     return a;
 }
 
+inline bool operator&&(const LockMode a, const LockMode b) {
+    return compatible[a][b];
+}
+
 inline std::istream& operator>>(std::istream& in, LockMode& mode) {
     std::string str;
     in >> str;
@@ -98,12 +142,14 @@ inline std::istream& operator>>(std::istream& in, LockMode& mode) {
 }
 
 using LockKey = uint64_t;
+struct Lock;
+using LockContainer = std::list<Lock>;
 
 struct Lock {
     LockKey key;
     std::string dbg_str;
     LockMode mode;
-    const std::list<Lock>::iterator prev;
+    LockContainer::iterator prev;
 };
 
 inline bool operator==(const Lock& a, const LockKey& key) {
@@ -112,7 +158,7 @@ inline bool operator==(const Lock& a, const LockKey& key) {
 
 struct Transaction {
     uint64_t id;
-    std::list<Lock> lock;
+    LockContainer lock;
     std::multimap<size_t, decltype(Transaction::lock)::iterator> table_map;
 };
 
@@ -189,7 +235,7 @@ static bool record_to_table_lock(Transaction& trx, Iter table_lock,
 
 template<class T>
 static int parse_lock(const T& strs, Transaction& trx,
-        size_t record_lock_limit, std::string extra) {
+        size_t record_lock_limit, std::string extra, bool direct_upgrade) {
     bool record;
     if (strs[0] == "TABLE") {
         LOG_ERR_EXIT(strs.size() < 9, EINVAL, std::system_category());
@@ -229,6 +275,12 @@ static int parse_lock(const T& strs, Transaction& trx,
         auto new_mode = lockit->mode + mode;
         if (new_mode != lockit->mode) {
             mode = new_mode;
+            /* if we cannot upgrade locks and locks are not compatible
+             * upgrade lock directly*/
+            if (direct_upgrade && !(mode && lockit->mode)) {
+                lockit->mode = mode;
+                insert = false;
+            }
         } else {
             insert = false;
         }
@@ -267,7 +319,7 @@ static int parse_lock(const T& strs, Transaction& trx,
 
 template<class T>
 static int parse_lock_log(std::istream& in, T& trxs, size_t record_lock_limit,
-        const std::string regex_str) {
+        const std::string regex_str, bool direct_upgrade) {
     bool lock = false;
     typename T::iterator trx;
     std::string extra;
@@ -289,7 +341,7 @@ static int parse_lock_log(std::istream& in, T& trxs, size_t record_lock_limit,
                 trx = trxs.insert(trxs.end(), Transaction{0, {}, {}});
             }
             lock = true;
-            parse_lock(strs, *trx, record_lock_limit, extra);
+            parse_lock(strs, *trx, record_lock_limit, extra, direct_upgrade);
         } else if (strs[0] == "QUERY") {
             if (regex_str != "") {
                 extra = parse_query_and_match(strs, regex_str);
@@ -307,58 +359,64 @@ int main(int argc, char* argv[]) {
     namespace bop = boost::program_options;
 
     bop::options_description desc("Options");
-    desc.add_options()("help", "produce this message")(
-        "ip", bop::value<psl::net::in_addr>()->required(), "server ip")(
-        "p", bop::value<psl::net::in_port_t>()->default_value(1234),
-        "server port")("l", bop::value<std::string>()->required(),
-                       "lock log-file")
+    // clang-format off
+    desc.add_options()
+        ("help", "produce this message")
+        ("ip", bop::value<psl::net::in_addr>()->required(), "server ip")
+        ("p", bop::value<psl::net::in_port_t>()->default_value(1234),
+         "server port")
+        ("l", bop::value<std::string>()->required(), "lock log-file")
         ("limit",
          bop::value<size_t>()->default_value(std::numeric_limits<size_t>::max()),
-        "transaction record lock limit -> upgrade to table lock if reached")
+         "transaction record lock limit -> upgrade to table lock if reached")
         ("match", bop::value<std::string>()->default_value(""),
-         "regex to match for extra");
+         "regex to match for extra")
+        ("direct_upgrade", "upgrade locks directly");
+  // clang-format on
 
-    bop::variables_map vm;
-    bop::store(bop::command_line_parser(argc, argv).options(desc).run(), vm);
+  bop::variables_map vm;
+  bop::store(bop::command_line_parser(argc, argv).options(desc).run(), vm);
 
-    if (vm.count("help")) {
-        std::cout << desc << "\n";
-        return 1;
+  if (vm.count("help")) {
+    std::cout << desc << "\n";
+    return 1;
+  }
+  bop::notify(vm);
+
+  // psl::net::in_addr ip = vm["ip"].as<psl::net::in_addr>();
+  // psl::net::in_port_t port = vm["p"].as<psl::net::in_port_t>();
+
+  std::string lock_log_path = vm["l"].as<std::string>();
+  std::fstream lock_log(lock_log_path);
+  LOG_ERR_EXIT(!lock_log.good(), EINVAL, std::system_category());
+
+  std::vector<Transaction> trxs;
+  int ret;
+  LOG_ERR_EXIT((ret = parse_lock_log(lock_log, trxs, vm["limit"].as<size_t>(),
+                                     vm["match"].as<std::string>(),
+                                     vm.count("direct_upgrade"))),
+               ret, std::system_category());
+
+  uint64_t n_locks_avg = 0;
+  uint32_t nn = 0;
+  for (auto &trx : trxs) {
+    std::cout << "---------------------------------------------------\n";
+    std::cout << "Transaction " << trx.id << '\n';
+    std::cout << "---------------------------------------------------\n";
+    std::cout << "n_locks: " << trx.lock.size() << '\n';
+    n_locks_avg += trx.lock.size();
+    for (auto &l : trx.lock) {
+      std::cout << "LOCK " << l.dbg_str << " [" << l.mode << "]\n";
     }
-    bop::notify(vm);
+    // // for (auto ul = trx.lock.rbegin(); ul != trx.lock.rend(); ul++) {
+    // //     std::cout << "UNLOCK " << ul->dbg_str << " [" << ul->mode <<
+    // "]\n";
+    // // }
+    nn++;
+  }
 
-    // psl::net::in_addr ip = vm["ip"].as<psl::net::in_addr>();
-    // psl::net::in_port_t port = vm["p"].as<psl::net::in_port_t>();
+  std::cout << "transactions: " << trxs.size() << '\n';
+  std::cout << "lock_avg: " << n_locks_avg / static_cast<double>(nn) << '\n';
 
-    std::string lock_log_path = vm["l"].as<std::string>();
-    std::fstream lock_log(lock_log_path);
-    LOG_ERR_EXIT(!lock_log.good(), EINVAL, std::system_category());
-
-    std::vector<Transaction> trxs;
-    int ret;
-    LOG_ERR_EXIT((ret = parse_lock_log(lock_log, trxs,
-                    vm["limit"].as<size_t>(), vm["match"].as<std::string>())),
-            ret, std::system_category());
-
-    uint64_t n_locks_avg = 0;
-    uint32_t nn = 0;
-    for (auto& trx : trxs) {
-        std::cout << "---------------------------------------------------\n";
-        std::cout << "Transaction " << trx.id << '\n';
-        std::cout << "---------------------------------------------------\n";
-        std::cout << "n_locks: " << trx.lock.size() << '\n';
-        n_locks_avg += trx.lock.size();
-        for (auto& l : trx.lock) {
-            std::cout << "LOCK " << l.dbg_str << " [" << l.mode << "]\n";
-        }
-        // for (auto ul = trx.lock.rbegin(); ul != trx.lock.rend(); ul++) {
-        //     std::cout << "UNLOCK " << ul->dbg_str << " [" << ul->mode << "]\n";
-        // }
-        nn++;
-    }
-
-    std::cout << "transactions: " << trxs.size() << '\n';
-    std::cout << "lock_avg: " << n_locks_avg / static_cast<double>(nn) << '\n';
-
-    return 0;
+  return 0;
 }
