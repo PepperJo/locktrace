@@ -94,7 +94,7 @@ static const bool compatible[LockMode::SIZE][LockMode::SIZE] =
                         [LockMode::IX] = false,
                         [LockMode::IS] = true,
                         [LockMode::SIX] = false}};
-// clang-format off
+// clang-format on
 
 inline std::ostream& operator<<(std::ostream& out, LockMode mode) {
     static const char* lockmode_to_str[] = {[LockMode::NL] = "NL",
@@ -150,6 +150,7 @@ struct Lock {
     std::string dbg_str;
     LockMode mode;
     LockContainer::iterator prev;
+    std::string extra;
 };
 
 inline bool operator==(const Lock& a, const LockKey& key) {
@@ -305,13 +306,13 @@ static int parse_lock(const T& strs, Transaction& trx,
                     auto new_lock = trx.lock.insert(
                         trx.lock.end(),
                         {key, dbg_str + " " + strs[12], mode,
-                         std::next(lockit).base()});
+                         std::next(lockit).base(), extra});
                     trx.table_map.insert({table_key, new_lock});
                 }
             }
         } else {
             trx.lock.push_back(
-                {key, dbg_str, mode, std::next(lockit).base()});
+                {key, dbg_str, mode, std::next(lockit).base(), extra});
         }
     }
     return 0;
@@ -362,9 +363,6 @@ int main(int argc, char* argv[]) {
     // clang-format off
     desc.add_options()
         ("help", "produce this message")
-        ("ip", bop::value<psl::net::in_addr>()->required(), "server ip")
-        ("p", bop::value<psl::net::in_port_t>()->default_value(1234),
-         "server port")
         ("l", bop::value<std::string>()->required(), "lock log-file")
         ("limit",
          bop::value<size_t>()->default_value(std::numeric_limits<size_t>::max()),
@@ -372,51 +370,53 @@ int main(int argc, char* argv[]) {
         ("match", bop::value<std::string>()->default_value(""),
          "regex to match for extra")
         ("direct_upgrade", "upgrade locks directly");
-  // clang-format on
+    // clang-format on
 
-  bop::variables_map vm;
-  bop::store(bop::command_line_parser(argc, argv).options(desc).run(), vm);
+    bop::variables_map vm;
+    bop::store(bop::command_line_parser(argc, argv).options(desc).run(), vm);
 
-  if (vm.count("help")) {
+    if (vm.count("help")) {
     std::cout << desc << "\n";
     return 1;
-  }
-  bop::notify(vm);
+    }
+    bop::notify(vm);
 
-  // psl::net::in_addr ip = vm["ip"].as<psl::net::in_addr>();
-  // psl::net::in_port_t port = vm["p"].as<psl::net::in_port_t>();
+    std::string lock_log_path = vm["l"].as<std::string>();
+    std::fstream lock_log(lock_log_path);
+    LOG_ERR_EXIT(!lock_log.good(), EINVAL, std::system_category());
 
-  std::string lock_log_path = vm["l"].as<std::string>();
-  std::fstream lock_log(lock_log_path);
-  LOG_ERR_EXIT(!lock_log.good(), EINVAL, std::system_category());
-
-  std::vector<Transaction> trxs;
-  int ret;
-  LOG_ERR_EXIT((ret = parse_lock_log(lock_log, trxs, vm["limit"].as<size_t>(),
+    std::vector<Transaction> trxs;
+    int ret;
+    LOG_ERR_EXIT((ret = parse_lock_log(lock_log, trxs, vm["limit"].as<size_t>(),
                                      vm["match"].as<std::string>(),
                                      vm.count("direct_upgrade"))),
                ret, std::system_category());
 
-  uint64_t n_locks_avg = 0;
-  uint32_t nn = 0;
-  for (auto &trx : trxs) {
-    std::cout << "---------------------------------------------------\n";
-    std::cout << "Transaction " << trx.id << '\n';
-    std::cout << "---------------------------------------------------\n";
-    std::cout << "n_locks: " << trx.lock.size() << '\n';
-    n_locks_avg += trx.lock.size();
-    for (auto &l : trx.lock) {
-      std::cout << "LOCK " << l.dbg_str << " [" << l.mode << "]\n";
+#ifdef DEBUG
+    uint64_t n_locks_avg = 0;
+    uint32_t nn = 0;
+    for (auto& trx : trxs) {
+        std::cout << "---------------------------------------------------\n";
+        std::cout << "Transaction " << trx.id << '\n';
+        std::cout << "---------------------------------------------------\n";
+        std::cout << "n_locks: " << trx.lock.size() << '\n';
+        n_locks_avg += trx.lock.size();
+        for (auto &l : trx.lock) {
+          std::cout << "LOCK " << l.dbg_str << " [" << l.mode << "]\n";
+        }
+        nn++;
     }
-    // // for (auto ul = trx.lock.rbegin(); ul != trx.lock.rend(); ul++) {
-    // //     std::cout << "UNLOCK " << ul->dbg_str << " [" << ul->mode <<
-    // "]\n";
-    // // }
-    nn++;
-  }
 
-  std::cout << "transactions: " << trxs.size() << '\n';
-  std::cout << "lock_avg: " << n_locks_avg / static_cast<double>(nn) << '\n';
+    std::cout << "transactions: " << trxs.size() << '\n';
+    std::cout << "lock_avg: " << n_locks_avg / static_cast<double>(nn) << '\n';
+#endif
 
-  return 0;
+    for (auto& trx : trxs) {
+        std::cout << "> " << trx.id << '\n';
+        for (auto& l : trx.lock) {
+            std::cout << l.key << ' ' << l.mode << ' ' << l.extra << '\n';
+        }
+    }
+
+    return 0;
 }
